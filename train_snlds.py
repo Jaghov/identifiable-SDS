@@ -12,7 +12,7 @@ from models.modules import MLP
 from models.VariationalSNLDS import VariationalSNLDS
 
 # Data generation settings
-device = 'cuda:1'
+device = 'cuda:0'
 data_type = 'cosine'
 data_size = 5000
 T = 200

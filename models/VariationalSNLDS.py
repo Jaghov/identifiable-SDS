@@ -41,7 +41,7 @@ class VariationalSNLDS(nn.Module):
         elif self.encoder_type=='video':
             self.img_embedding = CNNFastEncoder(3, hidden_dim, n_feat, n_layers=n_layers).to(device).float()
             self.encoder = nn.LSTM(hidden_dim, hidden_dim, num_layers=2, batch_first=True, bidirectional=True).to(device).float()
-            self.encoder_causal = nn.LSTM(hidden_dim*2, hidden_dim, num_layers=2, batch_first=True, bidirectional=False).to(device).float()
+            self.encoder_causal = nn.LSTM(hidden_dim*2, hidden_dim, num_layers=2, batch_first=True, bidirectional=False).to(device).float() # ASK Why causal after bidirectional?
             self.encoder_mean_var = nn.Linear(hidden_dim, 2*latent_dim).to(device).float()
         else:
             self.encoder = nn.LSTM(obs_dim, hidden_dim, num_layers=2, batch_first=True, bidirectional=True).to(device).float()
@@ -59,18 +59,37 @@ class VariationalSNLDS(nn.Module):
         # logits of p(s_1)
         self.pi = nn.Parameter(torch.zeros(num_states).to(device).float())
         #self.pi = torch.zeros(num_states).to(device)
-        # Init mean and covariances
+        # Init mean and covariances: Phi params
         self.init_mean = nn.Parameter(torch.randn(self.num_states, self.latent_dim).to(device).float())
         self.init_cov = nn.Parameter(((torch.rand(self.num_states,1,1)*torch.eye(self.latent_dim)[None,:,:])*5).to(device).float())
         self.covs = nn.Parameter((torch.eye(self.latent_dim)[None,:,:]).repeat(self.num_states,1,1).to(device).float())
     
     def _encode_obs(self, x):
+        """Encodes a sequence of observations as a pair of latent
+        variables zmu and z_log_var as well as it's encoded representation
+        as z which is reparemtrised as zmu + eps*z_std
+        
+        Parameters
+        ----------
+        x : Tensor(B,T,D) or Tensor(B,T,C,W,H)
+            Input observation. Either a series of observed states (B,T,D) or
+            and image of shape (B,T,C,W,H)
+        Returns
+        -------
+        sample : Tensor(B,T,latent_dim)
+            reparemetarised sampled encoding of the input
+        z_log_var : Tensor(B,T,latent_dim)
+            mean for encoding for each latent dim
+        z_mu : Tensor(B,T,latent_dim)
+            mean for encoding for each latent dim
+        
+        """
         if self.encoder_type=='factored':
             (B, T, D) = x.shape
             (z_mu, z_log_var) = self.encoder(x.reshape(B*T,-1)).split(self.latent_dim, dim=-1)
         elif self.encoder_type=='video':
             (B, T, C, W, H) = x.shape
-            x = self.img_embedding(x.reshape(B*T,C,W,H)).reshape(B,T,-1)
+            x = self.img_embedding(x.reshape(B*T,C,W,H)).reshape(B,T,-1) # Stacks the batch and time dimensions into one, performs the convolution, then unstacks them.
             output, _ = self.encoder(x)
             # output contains h^x_{1:T}
             output, _ = self.encoder_causal(output)
