@@ -3,8 +3,9 @@ from torch import nn
 from torch.distributions import MultivariateNormal, Categorical, Normal
 
 from models.modules import MLP, CNNFastEncoder, CNNFastDecoder
+from models.SNLDS import NeuralSNLDS
 
-class VariationalSNLDS(nn.Module):
+class VariationalSNLDS(NeuralSNLDS):
     ## Class could be combined with Abstract class MSM for code efficiency
     ## The model allows different settings where annealing=True implements schedule from
     ## Dong et al. (2020) https://proceedings.mlr.press/v119/dong20e.html;
@@ -13,12 +14,7 @@ class VariationalSNLDS(nn.Module):
     ## We recommend the setting with annealing=False and inference='alpha' and recurent encoder
     ## which is the best that worked for estimation.
     def __init__(self, obs_dim, latent_dim, hidden_dim, num_states, beta=1, encoder_type='recurent', device='cpu', annealing=False, inference='alpha'):
-        super(VariationalSNLDS, self).__init__()
-        self.obs_dim = obs_dim
-        self.hidden_dim = hidden_dim
-        self.latent_dim = latent_dim
-        self.num_states = num_states
-        self.device = device
+        super(VariationalSNLDS, self).__init__(obs_dim, latent_dim, hidden_dim, num_states, device, annealing)
         self.beta = beta
         self.var = torch.tensor(5e-4).to(device)
         self.scaling = 0
@@ -52,17 +48,6 @@ class VariationalSNLDS(nn.Module):
             self.decoder = CNNFastDecoder(latent_dim, 3, n_feat, n_layers=n_layers).to(device).float()
         else:
             self.decoder = MLP(latent_dim, obs_dim, hidden_dim, 'leakyrelu').to(device).float()
-        #self.decoder = nn.Linear(latent_dim, obs_dim).to(device)
-        ## MSM params
-        # logits of p(s_t|s_t-1)
-        self.Q = nn.Parameter(torch.zeros(self.num_states, self.num_states).to(device).float())
-        # logits of p(s_1)
-        self.pi = nn.Parameter(torch.zeros(num_states).to(device).float())
-        #self.pi = torch.zeros(num_states).to(device)
-        # Init mean and covariances: Phi params
-        self.init_mean = nn.Parameter(torch.randn(self.num_states, self.latent_dim).to(device).float())
-        self.init_cov = nn.Parameter(((torch.rand(self.num_states,1,1)*torch.eye(self.latent_dim)[None,:,:])*5).to(device).float())
-        self.covs = nn.Parameter((torch.eye(self.latent_dim)[None,:,:]).repeat(self.num_states,1,1).to(device).float())
     
     def _encode_obs(self, x):
         """Encodes a sequence of observations as a pair of latent
@@ -104,57 +89,7 @@ class VariationalSNLDS(nn.Module):
         sample = z_mu + z_std*eps
         return sample, z_mu, z_log_var
 
-    def _compute_local_evidence(self, z):
-        T = z.size(1)
-        init_distrib_ = torch.distributions.MultivariateNormal(self.init_mean, torch.matmul(self.init_cov,self.init_cov.transpose(1,2)) + 1e-6*torch.eye(self.latent_dim)[None,:,:].to(self.device))
-        log_local_evidence_1 = init_distrib_.log_prob(z[:,0:1,None,:].repeat(1,1,self.num_states,1))
-        if T==1:
-            return log_local_evidence_1
-        means_ = torch.cat([self.transitions[i](z[:,:-1, None,:]) for i in range(self.num_states)], dim=2)
-        covs = torch.matmul(self.covs,self.covs.transpose(1,2)) + 1e-6*torch.eye(self.latent_dim)[None,:,:].to(self.device)
-        distribs = [torch.distributions.MultivariateNormal(means_[:,:,i,:], covs[i,:,:]) for i in range(self.num_states)]
-        log_local_evidence_T = torch.cat([distribs[i].log_prob(z[:,1:,:])[:,:,None] for i in range(self.num_states)], dim=2)
-        return torch.cat([log_local_evidence_1, log_local_evidence_T], dim=1)
-
-    def _alpha(self, local_evidence):
-        N, T, _ = local_evidence.shape
-        log_Z = torch.zeros((N,T)).to(self.device)
-        log_alpha = torch.zeros((N, T, self.num_states)).to(self.device)
-        log_prob = local_evidence[:,0,:] + torch.log((self.pi/self.temperature).softmax(-1))
-        log_Z[:,0] = torch.logsumexp(log_prob, dim=-1)
-        log_alpha[:,0,:] = log_prob - log_Z[:,0,None]
-        Q = (self.Q[None,None,:,:].expand(N,T,-1,-1)/self.temperature).softmax(-1).transpose(2,3).log()
-        for t in range(1, T):
-            #log_prob = local_evidence[:,t,:] + torch.log(torch.matmul((Q.transpose(2,3))[:,t,:,:],alpha[:,t-1,:,None]))[:,:,0]
-            log_prob = torch.logsumexp(local_evidence[:,t,:, None] + Q[:,t,:,:] + log_alpha[:,t-1,None,:], dim=-1) 
-            
-            log_Z[:,t] = torch.logsumexp(log_prob, dim=-1)
-            log_alpha[:,t,:] = log_prob - log_Z[:,t,None]
-        return log_alpha, log_Z
-
-    def _beta(self, local_evidence, log_Z):
-        N, T, _ = local_evidence.shape
-        log_beta = torch.zeros((N, T, self.num_states)).to(self.device)
-        Q = (self.Q[None,None,:,:].expand(N,T,-1,-1)/self.temperature).softmax(-1).log()
-        for t in reversed(range(1, T)):
-            #beta_ = torch.matmul(Q[:,t,:,:], (torch.exp(local_evidence[:,t,:])*beta[:,t,:])[:,:,None])[:,:,0]
-            beta_ = torch.logsumexp(Q[:,t,:,:] + local_evidence[:,t,None,:] + log_beta[:,t,None,:], axis=-1)
-            log_beta[:,t-1,:] = beta_ - log_Z[:,t,None]
-        return log_beta
     
-    def _compute_posteriors(self, log_evidence):
-        log_alpha, log_Z = self._alpha(log_evidence)
-        log_beta = self._beta(log_evidence, log_Z)
-        log_gamma = log_alpha + log_beta
-        B, T, _ = log_evidence.shape
-        #alpha_beta_evidence = torch.matmul(alpha[:,:T-1,:,None], (beta*torch.exp(log_evidence))[:,1:,None,:])
-        log_alpha_beta_evidence = log_alpha[:,:T-1,:,None] + log_beta[:,1:,None,:] + log_evidence[:,1:,None,:]
-        Q = (self.Q[None,None,:,:].expand(B,T,-1,-1)/self.temperature).softmax(-1).log()
-        #paired_marginals = Q[:,1:,:,:]*(alpha_beta_evidence/torch.exp(log_Z[:,1:,None,None])).float()
-        log_paired_marginals = Q[:,1:,:,:] + log_alpha_beta_evidence - log_Z[:,1:,None,None]
-        
-        return log_gamma.exp().detach(), log_paired_marginals.exp().detach()
-
     def _decode(self, z):
         return self.decoder(z)
 
@@ -241,25 +176,3 @@ class VariationalSNLDS(nn.Module):
         losses = self._compute_elbo(x.reshape(B,T,-1), x_hat, z_mu, z_log_var, z_sample, log_Z, gamma, paired_marginals, log_evidence)
         return x_hat, z_sample, gamma, losses
     
-    def predict_sequence(self, input, seq_len=None):
-        (B, T, *_) = input.size()
-        if seq_len is None:
-            seq_len = T
-        z_sample, _, _ = self._encode_obs(input)
-        z_sample = z_sample.reshape(B,T,-1)
-        log_evidence = self._compute_local_evidence(z_sample)
-        gamma, _ = self._compute_posteriors(log_evidence)
-        #last_discrete = Categorical(gamma[:,-1,:]).sample()
-        last_discrete = gamma[:,-1,:].argmax(-1)
-        last_continous = z_sample[:,-1,:]
-        latent_seq = torch.zeros(B,seq_len,self.latent_dim).to(input.device)
-        Q = self.Q
-        for t in range(seq_len):
-            # next discrete state
-            last_discrete_distrib = torch.cat([Q[last_discrete[b].long(),:][None,:] for b in range(B)], dim=0)
-            last_discrete = Categorical(logits=last_discrete_distrib).sample()
-            # next observation mean
-            last_continous = torch.cat([self.transitions[last_discrete[b]](last_continous[b,None,:]) for b in range(B)], dim=0)
-            latent_seq[:,t,:] = last_continous
-        # decode
-        return self._decode(latent_seq.reshape(B*seq_len,-1)).reshape(B,seq_len,-1)

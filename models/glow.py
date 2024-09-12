@@ -131,12 +131,12 @@ class Actnorm(nn.Module):
         
     def forward(self, x):
         if self.initialised == False:
-            if self.input_type is 'image':
+            if self.input_type == 'image':
                 self.bias = nn.Parameter(-x.mean(dim=(0,2,3), keepdim=True), requires_grad=True)
                 self.log_scale = nn.Parameter(-torch.log(x.std(dim=(0,2,3), keepdim=True)), requires_grad=True)
                 self.input_size = x.shape[2] * x.shape[3] # h * w
             
-            elif self.input_type is 'factored':
+            elif self.input_type == 'factored':
                 self.bias = nn.Parameter(-x.mean(dim=(0), keepdim=True), requires_grad=True)
                 self.log_scale = nn.Parameter(-torch.log(x.std(dim=(0), keepdim=True)), requires_grad=True)
                 self.input_size = 1
@@ -144,7 +144,7 @@ class Actnorm(nn.Module):
             self.initialised = ~self.initialised
             
         z = (x  + self.bias) * self.log_scale.exp()
-        log_det_jacobian =  self.log_scale.exp().abs().sum().unsqueeze(0)  *self.input_size
+        log_det_jacobian =  self.log_scale.sum().unsqueeze(0)  *self.input_size
         return z, log_det_jacobian
     
     def inverse(self, z):
@@ -327,8 +327,127 @@ class FlowBlock(nn.Module):
         if self.input_type=='image':
             x = unsqueeze2d(x)
         return x
+
+class BatchNorm(nn.Module):
+    def __init__(self, latent_dim, input_type='image', dimensions=16 ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.register_buffer("scale", torch.zeros(3).unsqueeze(0))
+        self.register_buffer("bias", torch.zeros(3, dimensions, dimensions).unsqueeze(0))
+        self.log_alpha = nn.Parameter( torch.zeros(latent_dim+1), requires_grad=True)
+
+        self.input_type = input_type
+        self.register_buffer("initialised", torch.tensor(0, dtype=bool))
         
-       
+    def forward(self, x):
+        B, T, C, H, W = x.shape
+
+        x = x.reshape(B*T, C, H, W)
+        
+        if not self.initialised:
+            bias = -x.mean(dim=(0,2,3), keepdim=True)
+            scale = 1/x.std(dim=(0,2,3), keepdim=True)
+            input_size = x.shape[2] * x.shape[3] # h * w
+
+            z = (x  + bias) * scale
+
+            z = self.rescale(z)
+            
+            log_det_jacobian =  scale.abs().log().sum().unsqueeze(0)
+            log_det_jacobian += self.log_alpha[0] * (C*H*W - self.latent_dim) + self.log_alpha[1:].sum()
+
+            z = z.reshape(B, T, C, H, W)
+
+            return z, log_det_jacobian, scale, bias
+        
+            
+        z = (x  + self.bias) * self.scale
+        z = self.rescale(z)
+
+        log_det_jacobian =  self.scale.abs().log().sum().unsqueeze(0)  * input_size
+        log_det_jacobian += self.log_alpha[0] * (C*H*W - self.latent_dim) + self.log_alpha[1:].sum()
+
+        z = z.reshape(B, T, C, H, W)
+        return z, log_det_jacobian, None, None
+    
+    def inverse(self, z, scale, bias):
+        B, T, C, H, W = z.shape
+
+        z = z.reshape(B*T, C, H, W)
+
+
+        z = self.rescale(z, True)
+        if not self.initialised:
+            x = (z  / scale) - bias
+        else:
+            x = (z * torch.exp(-self.scale)) - self.bias
+        x = x.reshape(B, T, C, H, W)
+        return x
+    
+    def rescale(self, z, inverse=False):
+        B, C, H, W = z.shape
+        
+        z = z.reshape(B, -1)
+        # Independent gaussian variables
+        z[:,:-self.latent_dim] *=  ( torch.exp(self.log_alpha[0] * (-1 if inverse else 1) ) )
+
+        # Scale latents 
+        z[:,-self.latent_dim:] *=  ( torch.exp(self.log_alpha[-self.latent_dim:] * (-1 if inverse else 1) ) )
+
+        z = z.reshape(B, C, H, W)
+
+        return z
+    
+    def initialise(self, mean_scale, mean_bias):
+        
+        self.scale = mean_scale
+        self.bias = mean_bias
+
+        self.initialised = torch.tensor(True)
+
+        
+class PCABlock(nn.Module):
+    def __init__(self, input_size=None):
+        super().__init__()
+        self.mean_rotation = None
+    
+    def forward(self, x):
+        B, T, *_ = x.shape
+        z = x.reshape(B, T, -1)
+
+        if self.mean_rotation is None:
+            _, _, V = torch.linalg.svd(z)
+        else:
+            V = self.mean_rotation
+
+        
+        
+        z = z @ V.transpose(-2,-1)
+
+        return z.reshape(x.shape), V
+    
+    def inverse(self, z, V):
+        B, T, *_ = z.shape
+        x = z.reshape(B, T, -1)
+        # print(x.shape)
+        x = x @ V
+        return x.reshape(z.shape)
+    
+    def initialise(self, V_bar):
+        Q, _, Pt = torch.linalg.svd(V_bar, full_matrices=False)
+
+        V_tilde = Q @ Pt
+
+        if torch.det(V_tilde) < 0:
+            Q[:, -1] *= -1
+            V_tilde = Q @ Pt
+
+        self.mean_rotation = V_tilde
+
+        return
+        
+
+        
         
         
     
@@ -355,10 +474,13 @@ class Glow(nn.Module):
         h = x
         z_list = []
         
-        
         h = self.preprocess(h, train=train)
-            
+        
         log_det_jacobian_total = torch.zeros(x.shape[0], device=x.device)
+        
+        
+            
+        
         for block in self.flow_layers:
             z, h, log_det_jacobian = block(h)
             z_list.append(z)
